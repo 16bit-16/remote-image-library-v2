@@ -995,6 +995,76 @@ function PNG:GetPixel(x, y)
 	return color, alpha
 end
 
+-- Added for Remote-Image-Library v2.
+-- Writes the bitmap as tightly packed 8-bit RGBA into a Luau buffer, the
+-- format EditableImage:WritePixelsBuffer expects. Reads the bitmap directly
+-- instead of round-tripping through Color3. 16-bit channels keep the high byte.
+function PNG:ToRGBABuffer(): buffer
+	local width = self.Width
+	local height = self.Height
+	local colorType = self.ColorType
+	local step = self.BitDepth == 16 and 2 or 1
+	local bitmap = self.Bitmap
+
+	local palette, alphaData = self.Palette, self.AlphaData
+	local paletteBytes
+
+	if colorType == 3 then
+		assert(palette, "PNG - Palette image has no PLTE chunk.")
+		paletteBytes = {}
+		for i, color in palette do
+			paletteBytes[i] = {
+				math.floor(color.R * 255 + 0.5),
+				math.floor(color.G * 255 + 0.5),
+				math.floor(color.B * 255 + 0.5),
+				(alphaData and alphaData[i]) or 255,
+			}
+		end
+	end
+
+	local channels = self.NumChannels
+	local out = buffer.create(width * height * 4)
+	local o = 0
+
+	for y = 1, height do
+		local row = bitmap[y]
+		local i = 1
+
+		for _ = 1, width do
+			local r, g, b, a
+
+			if colorType == 6 then
+				r, g, b, a = row[i], row[i + step], row[i + step * 2], row[i + step * 3]
+			elseif colorType == 2 then
+				r, g, b, a = row[i], row[i + step], row[i + step * 2], 255
+			elseif colorType == 0 then
+				r = row[i]; g = r; b = r; a = 255
+			elseif colorType == 4 then
+				r = row[i]; g = r; b = r; a = row[i + step]
+			elseif colorType == 3 then
+				local entry = paletteBytes[row[i] + 1]
+				if entry then
+					r, g, b, a = entry[1], entry[2], entry[3], entry[4]
+				else
+					r, g, b, a = 0, 0, 0, 0
+				end
+			else
+				error("PNG - Unsupported colour type " .. tostring(colorType))
+			end
+
+			buffer.writeu8(out, o, r or 0)
+			buffer.writeu8(out, o + 1, g or 0)
+			buffer.writeu8(out, o + 2, b or 0)
+			buffer.writeu8(out, o + 3, a or 255)
+
+			o += 4
+			i += channels * step
+		end
+	end
+
+	return out
+end
+
 function PNG.new(buffer)
 	-- Create the reader.
 	local reader = BinaryReader.new(buffer)
