@@ -24,57 +24,74 @@ export type png = typeof(png.new());
 
 local is_server = run_service:IsServer();
 local builtin = {};
-local http_queue = {};
-local queue_active = false;
 
 
 --------------------------------------------------------------------------------
---  
+--
 -- http_get_async
 --
--- Performs a queued HTTP request.
+-- Performs a queued HTTP GET, yielding until it completes.
+-- Returns the response body, or errors in the calling thread on failure.
 --
 --------------------------------------------------------------------------------
-function http_get_async(url : string) : string
-	if not queue_active then
-		queue_active = true;
-		task.spawn(function()
-			while task.wait(HTTP_QUEUE_REQUESTS_PER_SEC) do
-				local req = http_queue[1];
+local http_queue: { { url: string, thread: thread } } = {}
+local queue_active = false
 
-				if not req then
-					continue;
-				end
-				
-				local success, res = pcall(function()
-					return http_service:GetAsync(req.url);
-				end);
+local function run_queue()
+	while #http_queue > 0 do
+		local req = table.remove(http_queue, 1)
 
-				req.fufil({
-					success = success,
-					data = res,
-				});
+		local success, res = pcall(http_service.GetAsync, http_service, req.url)
+		task.spawn(req.thread, success, res)
 
-				table.remove(http_queue, 1);
-			end
-		end);
+		task.wait(1 / HTTP_QUEUE_REQUESTS_PER_SEC)
 	end
-	
-	local data;
 
-	table.insert(http_queue, {
-		fufil = function(res)
-			if res.success then
-				data = res.data;
-			else
-				error(PRINT_LEADER .. "Get failed with: " .. data.data);
-			end
-		end,
-		url = url
-	});
+	queue_active = false
+end
 
-	repeat task.wait(); until data;
-	return data;
+local function http_get_async(url: string): string
+	assert(is_server, PRINT_LEADER .. "http_get_async can only be called on the server.")
+
+	table.insert(http_queue, { url = url, thread = coroutine.running() })
+
+	if not queue_active then
+		queue_active = true
+		-- Deferred so this thread has yielded before the worker can resume it
+		-- (matters when GetAsync or a mock returns without yielding).
+		task.defer(run_queue)
+	end
+
+	local success, res = coroutine.yield()
+
+	if not success then
+		error(PRINT_LEADER .. "GET " .. url .. " failed with: " .. tostring(res), 2)
+	end
+
+	return res
+end
+
+--------------------------------------------------------------------------------
+--
+-- fetch
+--
+-- Fetches raw PNG bytes, honouring the _G.REMOTE_IMG_CUSTOM_GET override.
+-- The override receives (url, http_get_async) so it can fall back to the
+-- built-in queue.
+--
+--------------------------------------------------------------------------------
+local function fetch(url: string): string
+	local custom = _G.REMOTE_IMG_CUSTOM_GET
+
+	if typeof(custom) == "function" then
+		local res = custom(url, http_get_async)
+		assert(typeof(res) == "string" or typeof(res) == "buffer",
+			PRINT_LEADER .. "REMOTE_IMG_CUSTOM_GET must return a string or buffer.")
+
+		return if typeof(res) == "buffer" then buffer.tostring(res) else res
+	end
+
+	return http_get_async(url)
 end
 
 --------------------------------------------------------------------------------
@@ -110,8 +127,7 @@ end
 --
 --------------------------------------------------------------------------------
 function url_to_png_obj(url : string) : png
-	local raw = _G["REMOTE_IMG_CUSTOM_GET"] or http_get_async(url);    
-	return png.new(raw);
+	return png.new(fetch(url));
 end
 
 
