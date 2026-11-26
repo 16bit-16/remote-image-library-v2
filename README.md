@@ -1,321 +1,171 @@
-# Remote Image Library
-Remote Image Library is a Luau library designed to generate EditableImage instances from PNG files from remote URLs, binary strings and pixel arrays.
+# Remote Image Library v2
 
-The EditableImage instance can be parented to a MeshPart, ImageLabel, ImageButton and Decal to replace its image. For more details on the EditableImage class, visit https://create.roblox.com/docs/reference/engine/classes/EditableImage.
+> Fork of [plainenglishh/remote-image-library](https://github.com/plainenglishh/remote-image-library) (MIT), ported to the current EditableImage API.
 
-### Table of Contents:
-- [1. Features](#1-features) 
-- [2. Usage](#2-usage)
-    - [2.1. Server Usage](#21-server-usage)
-    - [2.2. Server Usage](#22-client-usage)
-    - [2.3. Server Usage](#23-result)
-    - [2.2. Overloading http_get_async](#24-overloading-http_get_async)
-- [3. Attributions](#3-attributions)
-- [4. Installation](#4-installation)
-    - [4.1. Embedding Into a Rojo Project](#41-embedding-into-a-rojo-project)
-    - [4.2. Building from Source](#42-building-from-source)
-- [5. API Reference](#5-api-reference)
+Remote Image Library is a Luau library that creates `EditableImage`s from PNG files loaded from remote URLs, binary strings and pixel data.
+
+**v2** targets the current EditableImage API: images are created with `AssetService:CreateEditableImage` and shown through Content properties (`ImageLabel.ImageContent`, `MeshPart.TextureContent`, `Decal.TextureContent`, ...). EditableImage is no longer an Instance, so v1's `image.Parent = decal` no longer works. Use `remote_img.apply(target, image)` instead. See [Migrating from v1](#migrating-from-v1).
+
+### Table of Contents
+- [1. Features](#1-features)
+- [2. Requirements & Limits](#2-requirements--limits)
+- [3. Usage](#3-usage)
+- [4. Migrating from v1](#migrating-from-v1)
+- [5. Installation](#5-installation)
+- [6. API Reference](#6-api-reference)
+- [7. Attributions](#7-attributions)
 
 ## 1. Features
-Remote Image Library features:
-- Loading PNGs from;
-    - Urls,
-    - Binary Strings
-    - Pixel Arrays,
-- HTTP request queuing to prevent violating the rate limits.
-- An optional custom `http_get_async` override to integrate with your own queue / proxy.
-- Usage on both client & server with authentication.
+- Load PNGs from URLs, binary strings/buffers, or raw RGBA pixel data.
+- Queued HTTP requests to stay under rate limits.
+- Optional `http_get_async` override for your own proxy/cache.
+- Client usage with server-side authorisation. Pixels cross the remote as a compact `buffer`.
 
-## 2. Usage
+## 2. Requirements & Limits
 
 > [!WARNING]
-> This library was created as a demonstration, it is the responsibility of the user to ensure its use doesn't violate Roblox's TOS.
+> This library was created as a demonstration. It is your responsibility to make sure your use complies with Roblox's Terms of Use.
 
-### 2.1. Server Usage
-The simplest use of Remote Image Library is on the server. Please not that as of 2 December 2023, EditableImages do not replicate between the server->client boundry.
+- **EditableImage must be enabled for published experiences.** It fails by default; the experience owner must be 13+ and ID-verified, then enable it in Game Settings. It works in Studio regardless.
+- **HttpService must be enabled** (Game Settings → Security → Allow HTTP Requests).
+- EditableImages are **not replicated**. An image created on the server is only visible on the server. To show an image to players, create it on the client via `serve()` + client `create_image`.
+- Maximum size is **1024×1024**.
+- PNG only: 8-bit or 16-bit (16-bit is reduced to 8-bit), non-interlaced. Colour types: greyscale, greyscale+alpha, RGB, RGBA, 8-bit palette (with `tRNS` transparency). Bit depths 1/2/4 and interlaced (Adam7) files are rejected with an error.
+- Decoding is done in pure Luau and is not fast. Prefer small images.
+
+## 3. Usage
+
+### 3.1. Client (recommended: players can see the image)
 ```lua
-local remote_img = require(path.to.library);
-local spawn_location = workspace:WaitForChild("SpawnLocation");
-local editable_image = remote_img.create_image("https://i.imgur.com/eX24dFX.png");
+-- SERVER
+local remote_img = require(path.to.remote_img)
 
-editable_image.Parent = spawn_location:WaitForChild("Decal");
+remote_img.serve(function(player: Player, url: string)
+	return remote_img.builtin.protocols(url, { "https" })
+		and remote_img.builtin.hosts(url, { "i.imgur.com" })
+end)
+
+-- CLIENT (LocalScript)
+local remote_img = require(path.to.remote_img)
+
+local image = remote_img.create_image("https://i.imgur.com/eX24dFX.png")
+remote_img.apply(script.Parent.ImageLabel, image)
 ```
 
-### 2.2. Client Usage
+### 3.2. Server
 ```lua
--- SERVER:
-local remote_img = require(path.to.library);
-remote_img.serve(function(player : Player, url : string)
-    local is_https = remote_img.builtin.protocols(url, {"https"});
+local remote_img = require(path.to.remote_img)
 
-    local is_imgur = remote_img.builtin.hosts(url, { -- Limit to imgur
-        "i.imgur.com"
-    });
-
-    local is_player_allowed = remote_img.builtin.user_ids(player, { -- Limit players.
-        56098303
-    });
-
-    return is_https             -- Request must be using HTTPS
-        and is_imgur            -- and must be to i.imgur.com
-        and is_player_allowed;  -- and made by @plainenglish
-end);
-
--- CLIENT:
-local remote_img = require(path.to.library);
-local spawn_location = workspace:WaitForChild("SpawnLocation");
-local editable_image = remote_img.create_image("https://i.imgur.com/eX24dFX.png");
-editable_image.Parent = spawn_location:WaitForChild("Decal");
+local image = remote_img.create_image("https://i.imgur.com/eX24dFX.png")
+remote_img.apply(workspace.SpawnLocation.Decal, image)
 ```
 
-### 2.3. Result
-![image](./preview.png)
-
-### 2.4. Overriding http_get_async
-To use a custom http_get function, set the _G.REMOTE_IMG_CUSTOM_GET function to your own implementation. The API should match the original, see API Reference below.
+### 3.3. Without `apply`
+`apply` just sets the right Content property. You can do it yourself for any property that accepts an image:
 ```lua
-_G.REMOTE_IMG_CUSTOM_GET = function(url : string) : string
-    print(url, "requested.");
+image_label.ImageContent = Content.fromObject(image)
+```
+
+### 3.4. Overriding the HTTP GET
+Set `_G.REMOTE_IMG_CUSTOM_GET` to a function. It receives the URL and the built-in queued `http_get_async`, and must return the PNG as a string or buffer.
+```lua
+_G.REMOTE_IMG_CUSTOM_GET = function(url: string, http_get_async: (string) -> string): string
+	print(url, "requested.")
+	return http_get_async("https://my-proxy.example.com/?url=" .. game:GetService("HttpService"):UrlEncode(url))
 end
 ```
-> [!TIP]
-> This will *not* replace the original function meaning you can use it in your override.
 
-## 3. Attributions
-This library relies upon MaximumADHD's [Roblox-PNG-Library](https://github.com/MaximumADHD/Roblox-PNG-Library/tree/master) to get pixel data from PNG files.
+## Migrating from v1
+| v1 | v2 |
+| --- | --- |
+| `image.Parent = decal` | `remote_img.apply(decal, image)` or `decal.TextureContent = Content.fromObject(image)` |
+| `Instance.new("EditableImage")` internally | `AssetService:CreateEditableImage` |
+| Pixel table of `0-1` floats over the remote | 8-bit RGBA `buffer` over the remote |
+| `builtin.paths(url, {"eX24dFX.png"})` | `builtin.paths(url, {"/eX24dFX.png"})` (path now includes the leading `/`) |
+| `_G.REMOTE_IMG_CUSTOM_GET` was not actually called | It is called as `(url, http_get_async)` |
 
-## 4. Installation
-You can install Roblox Image Library by downloading the prebuilt model file from the GitHub release page. You may also install it with the following methods:
+`create_image_from_array` still accepts the v1 table of `0-1` floats, and now also accepts an 8-bit RGBA `buffer`.
 
-### 4.1. Embedding Into a Rojo Project
-To embed Remote Image Library into your project, download the `./src` directory and copy it into your project.
+### Bugs fixed in v2
+- A failed HTTP request crashed the queue worker, and the calling thread waited forever.
+- The queue waited 2 seconds between requests. `HTTP_QUEUE_REQUESTS_PER_SEC = 2` now means 2 per second.
+- `_G.REMOTE_IMG_CUSTOM_GET` was used as the response body instead of being called.
+- `builtin.paths` compared an off-by-one substring. `builtin.hosts`/`protocols` errored on URLs without `://` and were case-sensitive.
+- Greyscale PNGs were decoded as white (`Color3.fromHSV` was given 0-255 instead of 0-1).
+- Library functions leaked as globals.
 
-### 4.2. Building from Source
-To build the library from source, ensure you have rojo installed and run the following commands:
+## 5. Installation
+
+### 5.1. Prebuilt model
+Insert `remote_img.rbxmx` into `ReplicatedStorage` so both server and client can require it.
+
+### 5.2. Rojo
+Copy `./src` into your project, or build the model:
 ```bash
-# Check rojo is installed
-rojo --version    #> Rojo 7.4.0-rc3
-
-# Clone the git repo
-git clone https://github.com/MaximumADHD/Roblox-PNG-Library.git
-
-# Move into the downloaded repo
-cd Remote-Image-Library
-
-# Build the library, it will be available at ./remote_image.rbxmx
-rojo build -o "remote_img.rbxmx"
+git clone https://github.com/16bit-16/remote-image-library-v2.git
+cd remote-image-library-v2
+rojo build -o remote_img.rbxmx
+# or, without Rojo:
+lune run scripts/build.luau
 ```
 
-## 5. API Reference
+### 5.3. Running the tests
+See [tests/README.md](tests/README.md).
 
-1. [create_image](#create_image)
-2. [serve](#serve)
-3. [create_image_from_array](#create_image_from_array)
-4. [create_image_from_string](#create_image_from_string)
-5. [builtin.protocols](#builtinprotocols)
-6. [builtin.hosts](#builtinhosts)
-7. [builtin.paths](#builtinpaths)
-8. [builtin.user_ids](#builtinuser_ids)
-9. [builtin.allow_all](#builtinallow_all)
-10. [http_get_async](#http_get_async)
+## 6. API Reference
 
 ### create_image
-> The `create_image` function generates an EditableImage instance from the passed URL string.
-> 
-> #### Function Signature:
-> ```lua
-> create_image(url : string) : EditableImage
-> ```
->
-> #### Parameters:
-> 1. `url : string` - The URL to request image data from.
-> 
-> #### Returns:
-> 1. `EditableImage` - The generated Editable Image Instance.
-> 
-> #### Example Usage:
-> ```lua
-> local editable_image = remote_img.create_image("https://i.imgur.com/eX24dFX.png");
-> editable_image.Parent = game.Workspace.SpawnLocation.Decal;
-> ```
-
-### serve
-> The `serve` function allows clients to use `create_image` with an optional authentication function.
->
-> #### Function Signature:
-> ```lua
-> serve(auth : (Player, string) -> (boolean)?) : nil
-> ```
-> 
-> #### Parameters:
-> 1. `url : string` - The URL to request image data from.
-> 
-> #### Returns:
-> 1. `EditableImage` - The generated Editable Image Instance.
-> 
-> #### Example Usage:
-> ```lua
-> remote_img.serve(remote_img.builtin.allow_all);
-> ```
-
-### create_image_from_array
-> The `create_image_from_array` function creates an EditableImage from a pixel array.
->
-> #### Function Signature:
-> ```lua
-> create_image_from_array(pixel_array : string, width : number, height : number) : EditableImage
-> ```
-> 
-> #### Parameters:
-> 1. `pixel_array : {number}` - The flat pixel array (`{r, g, b, a,    r, g, b, a...}`)
-> 2. `width : number` - The width of the image.
-> 3. `height : number` - The height of the image.
-> 
-> #### Returns:
-> 1. `EditableImage` - The generated Editable Image Instance.
-> 
-> #### Example Usage:
-> ```lua
-> local red_pixels = {1, 0, 0, 0,    1, 0, 0, 0,
->                     1, 0, 0, 0,    1, 0, 0, 0};
->
-> local editable_image = remote_img.create_image_from_array(red_pixels, 2, 2);
-> editable_image.Parent = game.Workspace.SpawnLocation.Decal;
-> ```
+```lua
+create_image(url: string): EditableImage
+```
+Fetches and decodes the PNG at `url`. On the server it fetches directly. On the client it asks the server (which must have called `serve`) and builds the image locally. Errors if the request fails, is unauthorised, or the PNG is unsupported.
 
 ### create_image_from_string
-> The `create_image_from_string` function generates an EditableImage instance from the passed binary string (or buffer).
-> 
-> #### Function Signature:
-> ```lua
-> create_image_from_string(data : string | buffer) : EditableImage
-> ```
->
-> #### Parameters:
-> 1. `data : string | buffer` - The binary string containing the image data.
-> 
-> #### Returns:
-> 1. `EditableImage` - The generated Editable Image Instance.
-> 
-> #### Example Usage:
-> ```lua
-> local editable_image = remote_img.create_image_from_string("\x89\x50\x4E\x47...");
-> editable_image.Parent = game.Workspace.SpawnLocation.Decal;
-> ```
+```lua
+create_image_from_string(data: string | buffer): EditableImage
+```
+Decodes PNG bytes.
 
-### builtin.protocols
-> The `builtin.protocols` function returns true if the passed url's protocol is within the passed array.
-> 
-> #### Function Signature:
-> ```lua
-> builtin.protocols(url : string, protocols : {string}) : boolean
-> ```
->
-> #### Parameters:
-> 1. `url : string` - The image url.
-> 2. `protocols : {string}` - The allowed protocols.
-> 
-> #### Returns:
-> 1. `boolean` - Whether url's protocol is contained within protocols.
-> 
-> #### Example Usage:
-> ```lua
-> local is_https = remote_img.builtin.protocols("https://i.imgur.com/eX24dFX.png", {"https"});
-> ```
+### create_image_from_array
+```lua
+create_image_from_array(pixels: buffer | { number }, width: number, height: number): EditableImage
+```
+- `buffer`: tightly packed 8-bit RGBA, exactly `width * height * 4` bytes.
+- `{ number }`: flat RGBA floats in `0-1` (v1 format).
+```lua
+local red = buffer.create(2 * 2 * 4)
+for i = 0, 3 do
+	buffer.writeu32(red, i * 4, 0xFF0000FF) -- little-endian: R=FF G=00 B=00 A=FF
+end
+local image = remote_img.create_image_from_array(red, 2, 2)
+```
 
-### builtin.hosts
-> The `builtin.hosts` function returns true if the passed url's host is within the passed array.
-> 
-> Note: This function checks the urls entire host, including subdomain.
-> 
-> #### Function Signature:
-> ```lua
-> builtin.hosts(url : string, hosts : {string}) : boolean
-> ```
->
-> #### Parameters:
-> 1. `url : string` - The image url.
-> 2. `hosts : {string}` - The allowed hosts.
-> 
-> #### Returns:
-> 1. `boolean` - Whether url's protocol is contained within hosts.
-> 
-> #### Example Usage:
-> ```lua
-> local is_imgur = remote_img.builtin.hosts("https://i.imgur.com/eX24dFX.png", {"i.imgur.com"});
-> ```
+### apply
+```lua
+apply(target: Instance, image: EditableImage): ()
+```
+Sets `ImageContent` (ImageLabel, ImageButton) or `TextureContent` (MeshPart, Decal, Texture) to `Content.fromObject(image)`. Errors for other classes.
 
-### builtin.paths
-> The `builtin.paths` function returns true if the passed url's path is within the passed array.
-> 
-> #### Function Signature:
-> ```lua
-> builtin.paths(url : string, paths : {string}) : boolean
-> ```
->
-> #### Parameters:
-> 1. `url : string` - The image url.
-> 2. `paths : {string}` - The allowed paths.
-> 
-> #### Returns:
-> 1. `boolean` - Whether url's protocol is contained within hosts.
-> 
-> #### Example Usage:
-> ```lua
-> local is_bunny = remote_img.builtin.hosts("https://i.imgur.com/eX24dFX.png", {"eX24dFX.png"});
-> ```
+### serve
+```lua
+serve(auth: ((Player, string) -> boolean)?): ()
+```
+Server only. Lets clients call `create_image`. `auth` is called with the requesting player and URL; return `true` to allow. With no `auth`, all requests are allowed and a warning is printed (pass `builtin.allow_all` to silence it).
 
-### builtin.user_ids
-> The `builtin.user_ids` function returns true if the Player's UserId is within the passed array.
-> 
-> #### Function Signature:
-> ```lua
-> builtin.user_ids(player : Player, user_ids : {number}) : boolean
-> ```
->
-> #### Parameters:
-> 1. `player : Player` - The player.
-> 2. `user_ids : {number}` - The allowed user ids.
-> 
-> #### Returns:
-> 1. `boolean` - Whether player's user id is found.
-> 
-> #### Example Usage:
-> ```lua
-> local is_plain = remote_img.builtin.user_ids(game.Players.LocalPlayer, {56098303});
-> ```
-
-### builtin.allow_all
-> The `builtin.allow_all` function always returns true.
-> 
-> #### Function Signature:
-> ```lua
-> builtin.allow_all() : boolean
-> ```
-> 
-> #### Returns:
-> 1. `boolean` - True
-> 
-> #### Example Usage:
-> ```lua
-> local _true = remote_img.builtin.allow_all();
-> ```
+### builtin.protocols / hosts / paths / user_ids / allow_all
+```lua
+builtin.protocols(url: string, protocols: { string }): boolean -- {"https"}
+builtin.hosts(url: string, hosts: { string }): boolean         -- exact host incl. subdomain, case-insensitive: {"i.imgur.com"}
+builtin.paths(url: string, paths: { string }): boolean         -- path incl. leading "/" and query: {"/eX24dFX.png"}
+builtin.user_ids(player: Player, user_ids: { number }): boolean
+builtin.allow_all(): boolean
+```
 
 ### http_get_async
-> The `http_get_async` function queues a HTTP get request with the internal http queue and returns the result. Throws an error if unsuccessful.
-> 
-> #### Function Signature:
-> ```lua
-> http_get_async(url : string) : string
-> ```
->
-> #### Parameters:
-> 1. `url : string` - The target url
-> 
-> #### Returns:
-> 1. `string` - The response body.
-> 
-> #### Example Usage:
-> ```lua
-> local google_homepage = remote_img.http_get_async("https://google.com/");
-> ```
+```lua
+http_get_async(url: string): string
+```
+Server only. Queued `HttpService:GetAsync`. Returns the body or errors in the calling thread.
+
+## 7. Attributions
+PNG decoding uses MaximumADHD's [Roblox-PNG-Library](https://github.com/MaximumADHD/Roblox-PNG-Library) (MIT), with small fixes for v2.
