@@ -1,30 +1,48 @@
 --------------------------------------------------------------------------------
 --
--- Remote-Image-Library (./init.luau)
+-- Remote-Image-Library (./init.lua)
 --
 -- plainenglish
--- December 2023
+-- December 2023 (v1), ported to the Content-based EditableImage API (v2)
 --
--- A library to create an EditableImage instance from a remote PNG url.
--- Utilises MaximumADHD's Roblox-PNG-Library to parse the png data, packed into.
--- a single file for simplicities sake.
+-- A library to create an EditableImage from a remote PNG url.
+-- Utilises MaximumADHD's Roblox-PNG-Library to parse the png data, packed into
+-- a single file for simplicity's sake.
 -- (https://github.com/MaximumADHD/Roblox-PNG-Library/tree/master)
+--
+-- v2 notes:
+--   * EditableImage is no longer an Instance. It is created with
+--     AssetService:CreateEditableImage and displayed through Content
+--     properties (ImageLabel.ImageContent, MeshPart.TextureContent, ...).
+--     Use `apply(target, image)` instead of `image.Parent = target`.
+--   * Pixels are moved as an 8-bit RGBA buffer (WritePixelsBuffer), including
+--     over the client remote, instead of a giant table of floats.
 --
 --------------------------------------------------------------------------------
 
-local VERSION = "v1.0.2";
-local HTTP_QUEUE_REQUESTS_PER_SEC = 2;
-local PRINT_LEADER = "[Remote-Image-Library]: ";
+local VERSION = "v2.0.0"
+local HTTP_QUEUE_REQUESTS_PER_SEC = 2
+local MAX_SIZE = 1024
+local PRINT_LEADER = "[Remote-Image-Library]: "
 
-local http_service = game:GetService("HttpService");
-local run_service = game:GetService("RunService");
+local asset_service = game:GetService("AssetService")
+local http_service = game:GetService("HttpService")
+local run_service = game:GetService("RunService")
 
-local png = require(script.png);
-export type png = typeof(png.new());
+local png = require(script.png)
+export type png = typeof(png.new(""))
 
-local is_server = run_service:IsServer();
-local builtin = {};
+local is_server = run_service:IsServer()
+local builtin = {}
 
+-- Which Content property shows an image, per class.
+local CONTENT_PROPERTY = {
+	ImageLabel = "ImageContent",
+	ImageButton = "ImageContent",
+	MeshPart = "TextureContent",
+	Decal = "TextureContent",
+	Texture = "TextureContent",
+}
 
 --------------------------------------------------------------------------------
 --
@@ -95,148 +113,174 @@ local function fetch(url: string): string
 end
 
 --------------------------------------------------------------------------------
---  
--- get_pixel_array
 --
--- Returns a pixel array from a PNG object.
+-- decode
+--
+-- Decodes PNG bytes into (rgba_buffer, width, height).
 --
 --------------------------------------------------------------------------------
-function get_pixel_array(image : png) : {number}
-	local arr = {};
+local function decode(data: string): (buffer, number, number)
+	local image = png.new(data)
 
-	for y = 1, image.Height do
-		for x = 1, image.Width do
-			local colour, alpha = image:GetPixel(x, y);
+	if image.Width > MAX_SIZE or image.Height > MAX_SIZE then
+		error(string.format(
+			"%sImage is %dx%d, EditableImage is limited to %dx%d.",
+			PRINT_LEADER, image.Width, image.Height, MAX_SIZE, MAX_SIZE
+		), 2)
+	end
 
-			table.insert(arr, colour.R);
-			table.insert(arr, colour.G);
-			table.insert(arr, colour.B);
-			table.insert(arr, alpha);
+	return image:ToRGBABuffer(), image.Width, image.Height
+end
+
+--------------------------------------------------------------------------------
+--
+-- create_image_from_array
+--
+-- Creates an EditableImage from pixel data.
+--   * buffer: tightly packed 8-bit RGBA, width * height * 4 bytes.
+--   * table:  flat RGBA numbers in 0-1 (the v1 format), converted to a buffer.
+--
+--------------------------------------------------------------------------------
+local function create_image_from_array(pixels: buffer | { number }, width: number, height: number): EditableImage
+	assert(width >= 1 and height >= 1, PRINT_LEADER .. "Width and height must be at least 1.")
+	assert(width <= MAX_SIZE and height <= MAX_SIZE,
+		PRINT_LEADER .. "EditableImage is limited to " .. MAX_SIZE .. "x" .. MAX_SIZE .. ".")
+
+	local expected = width * height * 4
+	local buf: buffer
+
+	if typeof(pixels) == "buffer" then
+		buf = pixels
+	else
+		buf = buffer.create(expected)
+		for i = 1, math.min(#pixels, expected) do
+			buffer.writeu8(buf, i - 1, math.clamp(math.floor(pixels[i] * 255 + 0.5), 0, 255))
 		end
 	end
 
-	return arr;
-end
+	assert(buffer.len(buf) == expected, string.format(
+		"%sPixel data is %d bytes, expected %d (%dx%dx4).",
+		PRINT_LEADER, buffer.len(buf), expected, width, height
+	))
 
+	local size = Vector2.new(width, height)
+	local ok, editable_img = pcall(asset_service.CreateEditableImage, asset_service, { Size = size })
 
---------------------------------------------------------------------------------
---  
--- url_to_png_obj
---
--- Creates a png object from the provided url.
---
---------------------------------------------------------------------------------
-function url_to_png_obj(url : string) : png
-	return png.new(fetch(url));
-end
-
-
---------------------------------------------------------------------------------
---  
--- create_image_from_array
---
--- Creates an EditableImage from a pixel array.
---
---------------------------------------------------------------------------------
-function create_image_from_array(pixel_array : string, width : number, height : number) : EditableImage
-	local editable_img = Instance.new("EditableImage");
-	editable_img.Size = Vector2.new(width, height);
-
-	editable_img:WritePixels(
-		Vector2.new(0, 0),
-		Vector2.new(width, height),
-		pixel_array
-	);
-
-	return editable_img;
-end
-
-
---------------------------------------------------------------------------------
---  
--- create_image
---
--- Creates an EditableImage from a png url.
---
---------------------------------------------------------------------------------
-function create_image(url : string) : EditableImage
-	if is_server then
-		local image = url_to_png_obj(url);
-		local pixel_array = get_pixel_array(image);
-	
-		return create_image_from_array(pixel_array, image.Width, image.Height);
-	else
-		local remote = script:WaitForChild("communicator");
-		local data = remote:InvokeServer(url);
-		assert(data, PRINT_LEADER .. "Request unauthorised.")
-		local pixel_array, width, height = unpack(data);
-
-		return create_image_from_array(pixel_array, width, height);
+	if not ok or not editable_img then
+		error(
+			PRINT_LEADER .. "CreateEditableImage failed: " .. tostring(editable_img)
+			.. " (Is EditableImage enabled for this experience, and is the memory budget exhausted?)",
+			2
+		)
 	end
+
+	editable_img:WritePixelsBuffer(Vector2.zero, size, buf)
+
+	return editable_img
 end
 
-
 --------------------------------------------------------------------------------
---  
+--
 -- create_image_from_string
 --
--- Creates an EditableImage from a binary string.
+-- Creates an EditableImage from a PNG binary string or buffer.
 --
 --------------------------------------------------------------------------------
-function create_image_from_string(data : string | buffer) : EditableImage
+local function create_image_from_string(data: string | buffer): EditableImage
 	if typeof(data) == "buffer" then
-		data = buffer.tostring(data);
+		data = buffer.tostring(data)
 	end
-	
-	local image = png.new(data);
-	local pixel_array = get_pixel_array(image);
 
-	return create_image_from_array(pixel_array, image.Width, image.Height);
+	return create_image_from_array(decode(data :: string))
 end
 
+--------------------------------------------------------------------------------
+--
+-- create_image
+--
+-- Creates an EditableImage from a PNG url. On the client the server must have
+-- called `serve()`; the server fetches and decodes, the client builds the image.
+--
+--------------------------------------------------------------------------------
+local function create_image(url: string): EditableImage
+	if is_server then
+		return create_image_from_array(decode(fetch(url)))
+	end
+
+	local remote = script:WaitForChild("communicator") :: RemoteFunction
+	local res = remote:InvokeServer(url)
+
+	assert(typeof(res) == "table", PRINT_LEADER .. "Request unauthorised.")
+	assert(res.ok, PRINT_LEADER .. "Server failed to load image: " .. tostring(res.err))
+
+	return create_image_from_array(res.pixels, res.width, res.height)
+end
 
 --------------------------------------------------------------------------------
---  
--- serve
 --
--- Allows clients to execute 'create_image'
+-- apply
+--
+-- Displays an EditableImage on a GUI image, MeshPart, Decal or Texture by
+-- setting the matching Content property. Replaces v1's `image.Parent = target`.
 --
 --------------------------------------------------------------------------------
-function serve(auth_func : (Player, string) -> (boolean)?) : nil
+local function apply(target: Instance, image: EditableImage): ()
+	local property = CONTENT_PROPERTY[target.ClassName]
+	assert(property, PRINT_LEADER .. "Don't know how to apply an image to a " .. target.ClassName .. ".")
+
+	local instance: any = target
+	instance[property] = Content.fromObject(image)
+end
+
+--------------------------------------------------------------------------------
+--
+-- serve
+--
+-- Allows clients to execute 'create_image'. Pixels are sent back as a buffer.
+--
+--------------------------------------------------------------------------------
+local function serve(auth_func: ((Player, string) -> boolean)?): ()
+	assert(is_server, PRINT_LEADER .. "serve can only be called on the server.")
+
 	if not auth_func then
 		warn(
 			PRINT_LEADER
 			.. "No auth_func provided, all users have the ability to"
 			.. " use the create_image function. Pass 'builtin.allow_all'"
 			.. " into 'serve()' to silence this message."
-		);
+		)
 	end
-	
-	local remote = Instance.new("RemoteFunction");
-	remote.Name = "communicator";
-	remote.Parent = script;
 
-	-- string.sub(url, 0, 20) == "https://i.imgur.com/"
+	if script:FindFirstChild("communicator") then
+		warn(PRINT_LEADER .. "serve() was already called, ignoring.")
+		return
+	end
 
-	remote.OnServerInvoke = function(player : Player, url : string) : {number}?
-		if auth_func then		
-			if not auth_func(player, url) then
-				return nil;	
-			end
+	local remote = Instance.new("RemoteFunction")
+	remote.Name = "communicator"
+
+	remote.OnServerInvoke = function(player: Player, url: unknown)
+		if typeof(url) ~= "string" then
+			return nil
 		end
 
-		local img = url_to_png_obj(url);
+		if auth_func and not auth_func(player, url) then
+			return nil
+		end
 
-		return {
-			get_pixel_array(img),
-			img.Width,
-			img.Height
-		};
-	end;
+		local ok, pixels, width, height = pcall(function()
+			return decode(fetch(url))
+		end)
 
-	return nil;
+		if not ok then
+			return { ok = false, err = tostring(pixels) }
+		end
+
+		return { ok = true, pixels = pixels, width = width, height = height }
+	end
+
+	remote.Parent = script
 end
-
 
 --------------------------------------------------------------------------------
 --
@@ -321,10 +365,11 @@ end
 
 return {
 	create_image = create_image,
-	serve = serve,
 	create_image_from_array = create_image_from_array,
 	create_image_from_string = create_image_from_string,
+	apply = apply,
+	serve = serve,
 	builtin = builtin,
 	http_get_async = http_get_async,
-	version = VERSION
+	version = VERSION,
 }
