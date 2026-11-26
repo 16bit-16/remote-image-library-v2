@@ -2,307 +2,382 @@
   <Item class="ModuleScript" referent="0">
     <Properties>
       <string name="Name">remote_img</string>
-      <string name="Source">--------------------------------------------------------------------------------
+      <string name="Source"><![CDATA[--------------------------------------------------------------------------------
 --
--- Remote-Image-Library (./init.luau)
+-- Remote-Image-Library (./init.lua)
 --
 -- plainenglish
--- December 2023
+-- December 2023 (v1), ported to the Content-based EditableImage API (v2)
 --
--- A library to create an EditableImage instance from a remote PNG url.
--- Utilises MaximumADHD's Roblox-PNG-Library to parse the png data, packed into.
--- a single file for simplicities sake.
+-- A library to create an EditableImage from a remote PNG url.
+-- Utilises MaximumADHD's Roblox-PNG-Library to parse the png data, packed into
+-- a single file for simplicity's sake.
 -- (https://github.com/MaximumADHD/Roblox-PNG-Library/tree/master)
 --
+-- v2 notes:
+--   * EditableImage is no longer an Instance. It is created with
+--     AssetService:CreateEditableImage and displayed through Content
+--     properties (ImageLabel.ImageContent, MeshPart.TextureContent, ...).
+--     Use `apply(target, image)` instead of `image.Parent = target`.
+--   * Pixels are moved as an 8-bit RGBA buffer (WritePixelsBuffer), including
+--     over the client remote, instead of a giant table of floats.
+--
 --------------------------------------------------------------------------------
 
-local VERSION = "v1.0.2";
-local HTTP_QUEUE_REQUESTS_PER_SEC = 2;
-local PRINT_LEADER = "[Remote-Image-Library]: ";
+local VERSION = "v2.0.0"
+local HTTP_QUEUE_REQUESTS_PER_SEC = 2
+local MAX_SIZE = 1024
+local PRINT_LEADER = "[Remote-Image-Library]: "
 
-local http_service = game:GetService("HttpService");
-local run_service = game:GetService("RunService");
+local asset_service = game:GetService("AssetService")
+local http_service = game:GetService("HttpService")
+local run_service = game:GetService("RunService")
 
-local png = require(script.png);
-export type png = typeof(png.new());
+local png = require(script.png)
+export type png = typeof(png.new(""))
 
-local is_server = run_service:IsServer();
-local builtin = {};
-local http_queue = {};
-local queue_active = false;
+local is_server = run_service:IsServer()
+local builtin = {}
 
+-- Which Content property shows an image, per class.
+local CONTENT_PROPERTY = {
+	ImageLabel = "ImageContent",
+	ImageButton = "ImageContent",
+	MeshPart = "TextureContent",
+	Decal = "TextureContent",
+	Texture = "TextureContent",
+}
 
 --------------------------------------------------------------------------------
---  
+--
 -- http_get_async
 --
--- Performs a queued HTTP request.
+-- Performs a queued HTTP GET, yielding until it completes.
+-- Returns the response body, or errors in the calling thread on failure.
 --
 --------------------------------------------------------------------------------
-function http_get_async(url : string) : string
-	if not queue_active then
-		queue_active = true;
-		task.spawn(function()
-			while task.wait(HTTP_QUEUE_REQUESTS_PER_SEC) do
-				local req = http_queue[1];
+local http_queue: { { url: string, thread: thread } } = {}
+local queue_active = false
 
-				if not req then
-					continue;
-				end
-				
-				local success, res = pcall(function()
-					return http_service:GetAsync(req.url);
-				end);
+local function run_queue()
+	while #http_queue > 0 do
+		local req = table.remove(http_queue, 1)
 
-				req.fufil({
-					success = success,
-					data = res,
-				});
+		local success, res = pcall(http_service.GetAsync, http_service, req.url)
+		task.spawn(req.thread, success, res)
 
-				table.remove(http_queue, 1);
-			end
-		end);
+		task.wait(1 / HTTP_QUEUE_REQUESTS_PER_SEC)
 	end
-	
-	local data;
 
-	table.insert(http_queue, {
-		fufil = function(res)
-			if res.success then
-				data = res.data;
-			else
-				error(PRINT_LEADER .. "Get failed with: " .. data.data);
-			end
-		end,
-		url = url
-	});
+	queue_active = false
+end
 
-	repeat task.wait(); until data;
-	return data;
+local function http_get_async(url: string): string
+	assert(is_server, PRINT_LEADER .. "http_get_async can only be called on the server.")
+
+	table.insert(http_queue, { url = url, thread = coroutine.running() })
+
+	if not queue_active then
+		queue_active = true
+		-- Deferred so this thread has yielded before the worker can resume it
+		-- (matters when GetAsync or a mock returns without yielding).
+		task.defer(run_queue)
+	end
+
+	local success, res = coroutine.yield()
+
+	if not success then
+		error(PRINT_LEADER .. "GET " .. url .. " failed with: " .. tostring(res), 2)
+	end
+
+	return res
 end
 
 --------------------------------------------------------------------------------
---  
--- get_pixel_array
 --
--- Returns a pixel array from a PNG object.
+-- fetch
+--
+-- Fetches raw PNG bytes, honouring the _G.REMOTE_IMG_CUSTOM_GET override.
+-- The override receives (url, http_get_async) so it can fall back to the
+-- built-in queue.
 --
 --------------------------------------------------------------------------------
-function get_pixel_array(image : png) : {number}
-	local arr = {};
+local function fetch(url: string): string
+	local custom = _G.REMOTE_IMG_CUSTOM_GET
 
-	for y = 1, image.Height do
-		for x = 1, image.Width do
-			local colour, alpha = image:GetPixel(x, y);
+	if typeof(custom) == "function" then
+		local res = custom(url, http_get_async)
+		assert(typeof(res) == "string" or typeof(res) == "buffer",
+			PRINT_LEADER .. "REMOTE_IMG_CUSTOM_GET must return a string or buffer.")
 
-			table.insert(arr, colour.R);
-			table.insert(arr, colour.G);
-			table.insert(arr, colour.B);
-			table.insert(arr, alpha);
+		return if typeof(res) == "buffer" then buffer.tostring(res) else res
+	end
+
+	return http_get_async(url)
+end
+
+--------------------------------------------------------------------------------
+--
+-- decode
+--
+-- Decodes PNG bytes into (rgba_buffer, width, height).
+--
+--------------------------------------------------------------------------------
+local function decode(data: string): (buffer, number, number)
+	local image = png.new(data)
+
+	if image.Width > MAX_SIZE or image.Height > MAX_SIZE then
+		error(string.format(
+			"%sImage is %dx%d, EditableImage is limited to %dx%d.",
+			PRINT_LEADER, image.Width, image.Height, MAX_SIZE, MAX_SIZE
+		), 2)
+	end
+
+	return image:ToRGBABuffer(), image.Width, image.Height
+end
+
+--------------------------------------------------------------------------------
+--
+-- create_image_from_array
+--
+-- Creates an EditableImage from pixel data.
+--   * buffer: tightly packed 8-bit RGBA, width * height * 4 bytes.
+--   * table:  flat RGBA numbers in 0-1 (the v1 format), converted to a buffer.
+--
+--------------------------------------------------------------------------------
+local function create_image_from_array(pixels: buffer | { number }, width: number, height: number): EditableImage
+	assert(width >= 1 and height >= 1, PRINT_LEADER .. "Width and height must be at least 1.")
+	assert(width <= MAX_SIZE and height <= MAX_SIZE,
+		PRINT_LEADER .. "EditableImage is limited to " .. MAX_SIZE .. "x" .. MAX_SIZE .. ".")
+
+	local expected = width * height * 4
+	local buf: buffer
+
+	if typeof(pixels) == "buffer" then
+		buf = pixels
+	else
+		buf = buffer.create(expected)
+		for i = 1, math.min(#pixels, expected) do
+			buffer.writeu8(buf, i - 1, math.clamp(math.floor(pixels[i] * 255 + 0.5), 0, 255))
 		end
 	end
 
-	return arr;
-end
+	assert(buffer.len(buf) == expected, string.format(
+		"%sPixel data is %d bytes, expected %d (%dx%dx4).",
+		PRINT_LEADER, buffer.len(buf), expected, width, height
+	))
 
+	local size = Vector2.new(width, height)
+	local ok, editable_img = pcall(asset_service.CreateEditableImage, asset_service, { Size = size })
 
---------------------------------------------------------------------------------
---  
--- url_to_png_obj
---
--- Creates a png object from the provided url.
---
---------------------------------------------------------------------------------
-function url_to_png_obj(url : string) : png
-	local raw = _G["REMOTE_IMG_CUSTOM_GET"] or http_get_async(url);    
-	return png.new(raw);
-end
-
-
---------------------------------------------------------------------------------
---  
--- create_image_from_array
---
--- Creates an EditableImage from a pixel array.
---
---------------------------------------------------------------------------------
-function create_image_from_array(pixel_array : string, width : number, height : number) : EditableImage
-	local editable_img = Instance.new("EditableImage");
-	editable_img.Size = Vector2.new(width, height);
-
-	editable_img:WritePixels(
-		Vector2.new(0, 0),
-		Vector2.new(width, height),
-		pixel_array
-	);
-
-	return editable_img;
-end
-
-
---------------------------------------------------------------------------------
---  
--- create_image
---
--- Creates an EditableImage from a png url.
---
---------------------------------------------------------------------------------
-function create_image(url : string) : EditableImage
-	if is_server then
-		local image = url_to_png_obj(url);
-		local pixel_array = get_pixel_array(image);
-	
-		return create_image_from_array(pixel_array, image.Width, image.Height);
-	else
-		local remote = script:WaitForChild("communicator");
-		local data = remote:InvokeServer(url);
-		assert(data, PRINT_LEADER .. "Request unauthorised.")
-		local pixel_array, width, height = unpack(data);
-
-		return create_image_from_array(pixel_array, width, height);
+	if not ok or not editable_img then
+		error(
+			PRINT_LEADER .. "CreateEditableImage failed: " .. tostring(editable_img)
+			.. " (Is EditableImage enabled for this experience, and is the memory budget exhausted?)",
+			2
+		)
 	end
+
+	editable_img:WritePixelsBuffer(Vector2.zero, size, buf)
+
+	return editable_img
 end
 
-
 --------------------------------------------------------------------------------
---  
+--
 -- create_image_from_string
 --
--- Creates an EditableImage from a binary string.
+-- Creates an EditableImage from a PNG binary string or buffer.
 --
 --------------------------------------------------------------------------------
-function create_image_from_string(data : string | buffer) : EditableImage
+local function create_image_from_string(data: string | buffer): EditableImage
 	if typeof(data) == "buffer" then
-		data = buffer.tostring(data);
+		data = buffer.tostring(data)
 	end
-	
-	local image = png.new(data);
-	local pixel_array = get_pixel_array(image);
 
-	return create_image_from_array(pixel_array, image.Width, image.Height);
+	return create_image_from_array(decode(data :: string))
 end
 
+--------------------------------------------------------------------------------
+--
+-- create_image
+--
+-- Creates an EditableImage from a PNG url. On the client the server must have
+-- called `serve()`; the server fetches and decodes, the client builds the image.
+--
+--------------------------------------------------------------------------------
+local function create_image(url: string): EditableImage
+	if is_server then
+		return create_image_from_array(decode(fetch(url)))
+	end
+
+	local remote = script:WaitForChild("communicator") :: RemoteFunction
+	local res = remote:InvokeServer(url)
+
+	assert(typeof(res) == "table", PRINT_LEADER .. "Request unauthorised.")
+	assert(res.ok, PRINT_LEADER .. "Server failed to load image: " .. tostring(res.err))
+
+	return create_image_from_array(res.pixels, res.width, res.height)
+end
 
 --------------------------------------------------------------------------------
---  
--- serve
 --
--- Allows clients to execute 'create_image'
+-- apply
+--
+-- Displays an EditableImage on a GUI image, MeshPart, Decal or Texture by
+-- setting the matching Content property. Replaces v1's `image.Parent = target`.
 --
 --------------------------------------------------------------------------------
-function serve(auth_func : (Player, string) -> (boolean)?) : nil
+local function apply(target: Instance, image: EditableImage): ()
+	local property = CONTENT_PROPERTY[target.ClassName]
+	assert(property, PRINT_LEADER .. "Don't know how to apply an image to a " .. target.ClassName .. ".")
+
+	local instance: any = target
+	instance[property] = Content.fromObject(image)
+end
+
+--------------------------------------------------------------------------------
+--
+-- serve
+--
+-- Allows clients to execute 'create_image'. Pixels are sent back as a buffer.
+--
+--------------------------------------------------------------------------------
+local function serve(auth_func: ((Player, string) -> boolean)?): ()
+	assert(is_server, PRINT_LEADER .. "serve can only be called on the server.")
+
 	if not auth_func then
 		warn(
 			PRINT_LEADER
 			.. "No auth_func provided, all users have the ability to"
 			.. " use the create_image function. Pass 'builtin.allow_all'"
 			.. " into 'serve()' to silence this message."
-		);
+		)
 	end
-	
-	local remote = Instance.new("RemoteFunction");
-	remote.Name = "communicator";
-	remote.Parent = script;
 
-	-- string.sub(url, 0, 20) == "https://i.imgur.com/"
+	if script:FindFirstChild("communicator") then
+		warn(PRINT_LEADER .. "serve() was already called, ignoring.")
+		return
+	end
 
-	remote.OnServerInvoke = function(player : Player, url : string) : {number}?
-		if auth_func then		
-			if not auth_func(player, url) then
-				return nil;	
-			end
+	local remote = Instance.new("RemoteFunction")
+	remote.Name = "communicator"
+
+	remote.OnServerInvoke = function(player: Player, url: unknown)
+		if typeof(url) ~= "string" then
+			return nil
 		end
 
-		local img = url_to_png_obj(url);
+		if auth_func and not auth_func(player, url) then
+			return nil
+		end
 
-		return {
-			get_pixel_array(img),
-			img.Width,
-			img.Height
-		};
-	end;
+		local ok, pixels, width, height = pcall(function()
+			return decode(fetch(url))
+		end)
 
-	return nil;
+		if not ok then
+			return { ok = false, err = tostring(pixels) }
+		end
+
+		return { ok = true, pixels = pixels, width = width, height = height }
+	end
+
+	remote.Parent = script
 end
 
+--------------------------------------------------------------------------------
+--
+-- URL helpers used by the builtin checks.
+--
+--------------------------------------------------------------------------------
+local function split_url(url: string): (string?, string?, string?)
+	local protocol, rest = string.match(url, "^(%a[%w+.-]*)://(.*)$")
+	if not protocol then
+		return nil, nil, nil
+	end
+
+	local host, path = string.match(rest, "^([^/?#]*)(.*)$")
+	if path == "" then
+		path = "/"
+	end
+
+	return string.lower(protocol), string.lower(host), path
+end
 
 --------------------------------------------------------------------------------
---  
+--
 -- builtin.protocols
 --
--- Returns true if the provided url is one of the passed protocols.
+-- Returns true if the url uses one of the passed protocols (e.g. {"https"}).
 --
 --------------------------------------------------------------------------------
-function builtin.protocols(url : string, protocols : {string}) : boolean
-	local protocol = url:split("://")[1];
-	return table.find(protocols, protocol) ~= nil;
+function builtin.protocols(url: string, protocols: { string }): boolean
+	local protocol = split_url(url)
+	return protocol ~= nil and table.find(protocols, protocol) ~= nil
 end
 
-
 --------------------------------------------------------------------------------
---  
+--
 -- builtin.hosts
 --
--- Returns true if the provided url is one of the passed protocols.
+-- Returns true if the url's host is one of the passed hosts (exact match).
 --
 --------------------------------------------------------------------------------
-function builtin.hosts(url : string, hosts : {string}) : boolean
-	local host = url:split("://")[2]:split("/")[1];
-	return table.find(hosts, host) ~= nil;
+function builtin.hosts(url: string, hosts: { string }): boolean
+	local _, host = split_url(url)
+	return host ~= nil and table.find(hosts, host) ~= nil
 end
 
-
 --------------------------------------------------------------------------------
---  
--- builtin.user_ids
 --
--- Returns true if the provided player has one of the passed user_ids,
---
---------------------------------------------------------------------------------
-function builtin.user_ids(player : Player, user_ids : {number}) : boolean
-	return table.find(user_ids, player.UserId) ~= nil;
-end
-
-
---------------------------------------------------------------------------------
---  
 -- builtin.paths
 --
--- Returns true if the provided player has one of the passed user_ids,
+-- Returns true if the url's path (including any query) is one of the passed
+-- paths, e.g. {"/eX24dFX.png"}.
 --
 --------------------------------------------------------------------------------
-function builtin.paths(url : string, paths : {string}) : boolean
-	local protocol_len = #(url:split("://")[1]) + 3;
-	local host_len = #(url:split("://")[2]:split("/")[1]) + 2;
-
-	return table.find(paths, string.sub(url, protocol_len + host_len)) ~= nil;
+function builtin.paths(url: string, paths: { string }): boolean
+	local _, _, path = split_url(url)
+	return path ~= nil and table.find(paths, path) ~= nil
 end
 
+--------------------------------------------------------------------------------
+--
+-- builtin.user_ids
+--
+-- Returns true if the player has one of the passed user ids.
+--
+--------------------------------------------------------------------------------
+function builtin.user_ids(player: Player, user_ids: { number }): boolean
+	return table.find(user_ids, player.UserId) ~= nil
+end
 
 --------------------------------------------------------------------------------
---  
+--
 -- builtin.allow_all
 --
 -- Always returns true.
 --
 --------------------------------------------------------------------------------
-function builtin.allow_all() : boolean
-	return true;
+function builtin.allow_all(): boolean
+	return true
 end
-
 
 --------------------------------------------------------------------------------
 -- Export:
 
 return {
 	create_image = create_image,
-	serve = serve,
 	create_image_from_array = create_image_from_array,
 	create_image_from_string = create_image_from_string,
+	apply = apply,
+	serve = serve,
 	builtin = builtin,
 	http_get_async = http_get_async,
-	version = VERSION
-}</string>
+	version = VERSION,
+}
+]]></string>
     </Properties>
     <Item class="ModuleScript" referent="1">
       <Properties>
@@ -665,7 +740,7 @@ local Deflate = (function()
 			error("unrecognized zlib compression method: " .. cm)
 		end
 
-		if cinfo > 7 then
+		if cinfo &gt; 7 then
 			error("invalid zlib window size: cinfo=" .. cinfo)
 		end
 
@@ -877,7 +952,7 @@ local BinaryReader = (function()
 	end
 
 	function BinaryReader:TwosComplementOf(value, numBits)
-		if value >= (2 ^ (numBits - 1)) then
+		if value &gt;= (2 ^ (numBits - 1)) then
 			value = value - (2 ^ numBits)
 		end
 
@@ -949,7 +1024,7 @@ local Unfilter = (function()
 	end
 
 	function Unfilter:Up(scanline, pixels, bpp, row)
-		if row > 1 then
+		if row &gt; 1 then
 			local upperRow = pixels[row - 1]
 
 			for i = 1, #scanline do
@@ -963,7 +1038,7 @@ local Unfilter = (function()
 	end
 
 	function Unfilter:Average(scanline, pixels, bpp, row)
-		if row > 1 then
+		if row &gt; 1 then
 			for i = 1, bpp do
 				local x = scanline[i]
 				local b = pixels[row - 1][i]
@@ -997,7 +1072,7 @@ local Unfilter = (function()
 	end
 
 	function Unfilter:Paeth(scanline, pixels, bpp, row)
-		if row > 1 then
+		if row &gt; 1 then
 			local pr
 
 			for i = 1, bpp do
@@ -1262,7 +1337,7 @@ function PNG:GetPixel(x, y)
 	local color, alpha do
 		if colorType == 0 then
 			local gray = unpack(row, i0, i1)
-			color = Color3.fromHSV(0, 0, gray)
+			color = Color3.fromRGB(gray, gray, gray)
 			alpha = 255
 		elseif colorType == 2 then
 			local r, g, b = unpack(row, i0, i1)
@@ -1284,7 +1359,7 @@ function PNG:GetPixel(x, y)
 			end
 		elseif colorType == 4 then
 			local gray, a = unpack(row, i0, i1)
-			color = Color3.fromHSV(0, 0, gray)
+			color = Color3.fromRGB(gray, gray, gray)
 			alpha = a
 		elseif colorType == 6 then
 			local r, g, b, a = unpack(row, i0, i1)
@@ -1302,6 +1377,76 @@ function PNG:GetPixel(x, y)
 	end
 	
 	return color, alpha
+end
+
+-- Added for Remote-Image-Library v2.
+-- Writes the bitmap as tightly packed 8-bit RGBA into a Luau buffer, the
+-- format EditableImage:WritePixelsBuffer expects. Reads the bitmap directly
+-- instead of round-tripping through Color3. 16-bit channels keep the high byte.
+function PNG:ToRGBABuffer(): buffer
+	local width = self.Width
+	local height = self.Height
+	local colorType = self.ColorType
+	local step = self.BitDepth == 16 and 2 or 1
+	local bitmap = self.Bitmap
+
+	local palette, alphaData = self.Palette, self.AlphaData
+	local paletteBytes
+
+	if colorType == 3 then
+		assert(palette, "PNG - Palette image has no PLTE chunk.")
+		paletteBytes = {}
+		for i, color in palette do
+			paletteBytes[i] = {
+				math.floor(color.R * 255 + 0.5),
+				math.floor(color.G * 255 + 0.5),
+				math.floor(color.B * 255 + 0.5),
+				(alphaData and alphaData[i]) or 255,
+			}
+		end
+	end
+
+	local channels = self.NumChannels
+	local out = buffer.create(width * height * 4)
+	local o = 0
+
+	for y = 1, height do
+		local row = bitmap[y]
+		local i = 1
+
+		for _ = 1, width do
+			local r, g, b, a
+
+			if colorType == 6 then
+				r, g, b, a = row[i], row[i + step], row[i + step * 2], row[i + step * 3]
+			elseif colorType == 2 then
+				r, g, b, a = row[i], row[i + step], row[i + step * 2], 255
+			elseif colorType == 0 then
+				r = row[i]; g = r; b = r; a = 255
+			elseif colorType == 4 then
+				r = row[i]; g = r; b = r; a = row[i + step]
+			elseif colorType == 3 then
+				local entry = paletteBytes[row[i] + 1]
+				if entry then
+					r, g, b, a = entry[1], entry[2], entry[3], entry[4]
+				else
+					r, g, b, a = 0, 0, 0, 0
+				end
+			else
+				error("PNG - Unsupported colour type " .. tostring(colorType))
+			end
+
+			buffer.writeu8(out, o, r or 0)
+			buffer.writeu8(out, o + 1, g or 0)
+			buffer.writeu8(out, o + 2, b or 0)
+			buffer.writeu8(out, o + 3, a or 255)
+
+			o += 4
+			i += channels * step
+		end
+	end
+
+	return out
 end
 
 function PNG.new(buffer)
@@ -1331,7 +1476,7 @@ function PNG.new(buffer)
 		
 		local data, crc
 		
-		if length > 0 then
+		if length &gt; 0 then
 			data = reader:ForkReader(length)
 			crc = reader:ReadUInt32()
 		end
@@ -1355,6 +1500,20 @@ function PNG.new(buffer)
 		table.insert(file.Chunks, chunk)
 	end
 	
+	-- Reject layouts this decoder can't unfilter correctly.
+	-- (Added for Remote-Image-Library v2: previously these produced garbage.)
+	if file.Methods and file.Methods.Interlace ~= 0 then
+		error("PNG - Interlaced (Adam7) PNGs are not supported.", 2)
+	end
+
+	if file.BitDepth ~= 8 and file.BitDepth ~= 16 then
+		error("PNG - Bit depth " .. tostring(file.BitDepth) .. " is not supported (only 8 and 16).", 2)
+	end
+
+	if file.ColorType == 3 and file.BitDepth ~= 8 then
+		error("PNG - Palette PNGs must be 8-bit.", 2)
+	end
+
 	-- Decompress the zlib stream.
 	local success, response = pcall(function ()
 		local result = {}
