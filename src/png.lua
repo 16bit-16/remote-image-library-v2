@@ -953,7 +953,7 @@ function PNG:GetPixel(x, y)
 	local color, alpha do
 		if colorType == 0 then
 			local gray = unpack(row, i0, i1)
-			color = Color3.fromHSV(0, 0, gray)
+			color = Color3.fromRGB(gray, gray, gray)
 			alpha = 255
 		elseif colorType == 2 then
 			local r, g, b = unpack(row, i0, i1)
@@ -975,7 +975,7 @@ function PNG:GetPixel(x, y)
 			end
 		elseif colorType == 4 then
 			local gray, a = unpack(row, i0, i1)
-			color = Color3.fromHSV(0, 0, gray)
+			color = Color3.fromRGB(gray, gray, gray)
 			alpha = a
 		elseif colorType == 6 then
 			local r, g, b, a = unpack(row, i0, i1)
