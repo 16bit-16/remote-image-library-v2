@@ -239,69 +239,82 @@ end
 
 
 --------------------------------------------------------------------------------
---  
+--
+-- URL helpers used by the builtin checks.
+--
+--------------------------------------------------------------------------------
+local function split_url(url: string): (string?, string?, string?)
+	local protocol, rest = string.match(url, "^(%a[%w+.-]*)://(.*)$")
+	if not protocol then
+		return nil, nil, nil
+	end
+
+	local host, path = string.match(rest, "^([^/?#]*)(.*)$")
+	if path == "" then
+		path = "/"
+	end
+
+	return string.lower(protocol), string.lower(host), path
+end
+
+--------------------------------------------------------------------------------
+--
 -- builtin.protocols
 --
--- Returns true if the provided url is one of the passed protocols.
+-- Returns true if the url uses one of the passed protocols (e.g. {"https"}).
 --
 --------------------------------------------------------------------------------
-function builtin.protocols(url : string, protocols : {string}) : boolean
-	local protocol = url:split("://")[1];
-	return table.find(protocols, protocol) ~= nil;
+function builtin.protocols(url: string, protocols: { string }): boolean
+	local protocol = split_url(url)
+	return protocol ~= nil and table.find(protocols, protocol) ~= nil
 end
 
-
 --------------------------------------------------------------------------------
---  
+--
 -- builtin.hosts
 --
--- Returns true if the provided url is one of the passed protocols.
+-- Returns true if the url's host is one of the passed hosts (exact match).
 --
 --------------------------------------------------------------------------------
-function builtin.hosts(url : string, hosts : {string}) : boolean
-	local host = url:split("://")[2]:split("/")[1];
-	return table.find(hosts, host) ~= nil;
+function builtin.hosts(url: string, hosts: { string }): boolean
+	local _, host = split_url(url)
+	return host ~= nil and table.find(hosts, host) ~= nil
 end
 
-
 --------------------------------------------------------------------------------
---  
--- builtin.user_ids
 --
--- Returns true if the provided player has one of the passed user_ids,
---
---------------------------------------------------------------------------------
-function builtin.user_ids(player : Player, user_ids : {number}) : boolean
-	return table.find(user_ids, player.UserId) ~= nil;
-end
-
-
---------------------------------------------------------------------------------
---  
 -- builtin.paths
 --
--- Returns true if the provided player has one of the passed user_ids,
+-- Returns true if the url's path (including any query) is one of the passed
+-- paths, e.g. {"/eX24dFX.png"}.
 --
 --------------------------------------------------------------------------------
-function builtin.paths(url : string, paths : {string}) : boolean
-	local protocol_len = #(url:split("://")[1]) + 3;
-	local host_len = #(url:split("://")[2]:split("/")[1]) + 2;
-
-	return table.find(paths, string.sub(url, protocol_len + host_len)) ~= nil;
+function builtin.paths(url: string, paths: { string }): boolean
+	local _, _, path = split_url(url)
+	return path ~= nil and table.find(paths, path) ~= nil
 end
 
+--------------------------------------------------------------------------------
+--
+-- builtin.user_ids
+--
+-- Returns true if the player has one of the passed user ids.
+--
+--------------------------------------------------------------------------------
+function builtin.user_ids(player: Player, user_ids: { number }): boolean
+	return table.find(user_ids, player.UserId) ~= nil
+end
 
 --------------------------------------------------------------------------------
---  
+--
 -- builtin.allow_all
 --
 -- Always returns true.
 --
 --------------------------------------------------------------------------------
-function builtin.allow_all() : boolean
-	return true;
+function builtin.allow_all(): boolean
+	return true
 end
-
 
 --------------------------------------------------------------------------------
 -- Export:
