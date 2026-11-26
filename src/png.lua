@@ -1046,6 +1046,20 @@ function PNG.new(buffer)
 		table.insert(file.Chunks, chunk)
 	end
 	
+	-- Reject layouts this decoder can't unfilter correctly.
+	-- (Added for Remote-Image-Library v2: previously these produced garbage.)
+	if file.Methods and file.Methods.Interlace ~= 0 then
+		error("PNG - Interlaced (Adam7) PNGs are not supported.", 2)
+	end
+
+	if file.BitDepth ~= 8 and file.BitDepth ~= 16 then
+		error("PNG - Bit depth " .. tostring(file.BitDepth) .. " is not supported (only 8 and 16).", 2)
+	end
+
+	if file.ColorType == 3 and file.BitDepth ~= 8 then
+		error("PNG - Palette PNGs must be 8-bit.", 2)
+	end
+
 	-- Decompress the zlib stream.
 	local success, response = pcall(function ()
 		local result = {}
